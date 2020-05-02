@@ -24,11 +24,9 @@ import itertools
 from scipy.optimize import brute
 import vquad
 import kwant
-from stus_tools import *
 import threading
 import asyncio
 from copy import deepcopy
-import adaptive
 import quickle
 
 from scipy.sparse import csr_matrix
@@ -39,18 +37,22 @@ from scipy.stats import linregress
 
 from numpy import linalg as nla
 
-import ipywidgets
-from IPython.display import display
-
-os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['NUMEXPR_NUM_THREADS'] = '1'
-# these cause numpy to not parallelize, so the multiprocessing can parallelize more efficiently
-os.environ['MKL_NUM_THREADS'] = '1'
-#TODO: move these out of this module
-
-
-# define Pauli-matrices for convenience
+# define Pauli-matrix indices for convenience
 x, y, z = (1, 2, 3)
+
+
+def kron(*args):
+    ''' define kronecker product function for >2 matrices, using associativity of kronecker product. '''
+    if len(args) == 1:
+        return args[0]
+    else:
+        ret = np.kron(args[0], args[1])
+        for a in args[2:]:
+            ret = np.kron(ret, a)
+        return ret
+
+
+def d(i, j): return 1 if i == j else 0  # kronecker delta
 
 
 class PauliMatrices:
@@ -63,48 +65,16 @@ class PauliMatrices:
             ta.array([[1, 0], [0, -1]])
         ]
 
-    def __kron(self, *args):
-        # define kronecker product function for >2 matrices, using associativity of kronecker product.
-        if len(args) == 1:
-            return args[0]
-        else:
-            ret = np.kron(args[0], args[1])
-            for a in args[2:]:
-                ret = np.kron(ret, a)
-            return ret
-
     def __getitem__(self, key):
         if type(key) is not tuple:
             key = (key,)
-        return ta.array(self.__kron(*(self.__s[i] for i in key)))
+        return ta.array(kron(*(self.__s[i] for i in key)))
 
 
 tau = PauliMatrices()
 
-
-# for some backwards compatibilty
-s_0 = tau[0]
-s_x = tau[x]
-s_y = tau[y]
-s_z = tau[z]
-
-
 e_mat = 0.5*(tau[0]+tau[z])
 h_mat = 0.5*(tau[0]-tau[z])
-
-
-def d(i, j): return 1 if i == j else 0  # kronecker delta
-
-
-def kron(*args):
-    # define kronecker product function for >2 matrices, using associativity of kronecker product.
-    if len(args) == 1:
-        return args[0]
-    else:
-        ret = np.kron(args[0], args[1])
-        for a in args[2:]:
-            ret = np.kron(ret, a)
-        return ret
 
 
 # creates a vertical basis vector ([[0],[0],[1],[0],...[0]]) with n components and a 1 element at index i
@@ -179,40 +149,32 @@ class SystemInfo:
         -----------
         If m<n, (n-m) orthogonal modes are added with with complete reflection so the resultant matrix is mxm.
 
-        If the the Hamiltonian has some degeneracy, this must be address by a conservation law when building the system. 
+        If the the Hamiltonian has some degeneracy, this must be address by a conservation law when building the system.
         Otherwise, these degenerate states may form unorthogonal propogating modes.
 
         '''
         if mat.size == 0:
             raise Exception("Matrix is empty")
-        
+
         def normalize_columns(M):
             return M / np.tile(np.linalg.norm(M, axis=0), (M.shape[0], 1))
-        
+
         def is_unitary(M):
             return np.allclose(dagger(M)@M, np.eye(M.shape[1]))
-        
+
         wf_in = normalize_columns(wf_in)
-        wf_out = normalize_columns(wf_out) 
+        wf_out = normalize_columns(wf_out)
         if not (is_unitary(wf_in) and is_unitary(wf_out)):
-            raise Exception("Propogating modes must be orthogonal. This may be the caused by a degeneracy unaddressed by a kwant conservation law.")
+            raise Exception(
+                "Propogating modes must be orthogonal. This may be the caused by a degeneracy unaddressed by a kwant conservation law.")
 
         # extend modes to span all Nambu space, even with modes that do not actually exists with a QR decomposition.
         # For "modes" that do not actually exist in the leads, we implement complete reflection.
         # This helps facilitate the matrix solution in calculate_current().
-        # num_pmodes = wf_in.shape[0]-wf_in.shape[1]
-        # if num_pmodes > 0:
-        #     wf_in = np.hstack((wf_in, 
-        #             np.linalg.qr(wf_in,   mode='complete')[0][:, num_pmodes:]))
-        #     wf_out = np.hstack((wf_out, 
-        #             np.linalg.qr(np.conj(wf_out), mode='complete')[0][:, num_pmodes:]))
-        #     mat = block_diag(mat, np.identity(num_pmodes))
-
-        #r = wf_out @ mat @ np.linalg.inv(wf_in)
-        #return r
 
         r = wf_out @ mat @ dagger(wf_in)
-        t = sqrtm(np.identity(wf_out.shape[0]) - wf_out @ dagger(wf_out)) #if a particle has no modes in the lead, return 100% reflection, not 0%
+        # if a particle has no modes in the lead, return 100% reflection, not 0%
+        t = sqrtm(np.identity(wf_out.shape[0]) - wf_out @ dagger(wf_out))
         return r + t
 
     def _refl_LR(self, d, E, params, complete=True):
@@ -238,7 +200,8 @@ class SystemInfo:
         try:
             ksmat = kwant.smatrix(self.systs[d], E, params=params)
         except ValueError:
-            ksmat = kwant.smatrix(self.systs[d], E + 1e-4, params=params)  # this is to counter a bug in kwant
+            # this is to counter a bug in kwant
+            ksmat = kwant.smatrix(self.systs[d], E + 1e-4, params=params)
 
         lead_num = 1 if d == L else 0
         modes = ksmat.lead_info[lead_num].wave_functions
@@ -270,7 +233,8 @@ class SystemInfo:
         try:
             ksmat = kwant.smatrix(self.systs[N], E, params=params)
         except ValueError:
-            ksmat = kwant.smatrix(self.systs[N], E + 1e-4, params=params)  # this is to counter a bug in kwant
+            # this is to counter a bug in kwant
+            ksmat = kwant.smatrix(self.systs[N], E + 1e-4, params=params)
 
         left_modes = ksmat.lead_info[0].wave_functions
         right_modes = ksmat.lead_info[1].wave_functions
@@ -320,24 +284,28 @@ class SystemInfo:
     # Interpolation
     @staticmethod
     def complexify(new_a):
-        return new_a[:,:,0] + 1j*new_a[:,:,1]
+        return new_a[:, :, 0] + 1j*new_a[:, :, 1]
+
     @staticmethod
     def decomplexify(a):
         new_a = np.empty(a.shape+(2,), dtype=np.float)
-        new_a[:,:,0] = np.real(a)
-        new_a[:,:,1] = np.imag(a)
+        new_a[:, :, 0] = np.real(a)
+        new_a[:, :, 1] = np.imag(a)
         return new_a
-        
+
     def get_learners(self, key, bounds, dview):
         SystemInfo._validate_key(key)
         self._Ebounds = bounds
+
         def decomp(f):
-            def wrapper(E): 
-                return SystemInfo.decomplexify(f(E)) #adaptive does not work with complex matrices
+            def wrapper(E):
+                # adaptive does not work with complex matrices
+                return SystemInfo.decomplexify(f(E))
             return wrapper
 
-        funcs = {'L': decomp(self.refl_L), 'N': decomp(self.smat_N), 'R': decomp(self.refl_R)}
-        hashed_funcs = {k:quickle.quickle(v, dview) for k,v in funcs.items()}
+        funcs = {'L': decomp(self.refl_L), 'N': decomp(
+            self.smat_N), 'R': decomp(self.refl_R)}
+        hashed_funcs = {k: quickle.quickle(v, dview) for k, v in funcs.items()}
         return [adaptive.Learner1D(hashed_funcs[k], bounds=bounds) for k in key]
 
     def update_interpolators(self, key, learners):
@@ -346,7 +314,7 @@ class SystemInfo:
             energies = list(l.data.keys())
             mats = [SystemInfo.complexify(mat) for mat in l.data.values()]
             self.interpolators[eval(k)] = interp1d(energies, mats, axis=0)
-        
+
     def interpolated(self, key):
         if type(key) is int:
             return not self.interpolators[key] is None
@@ -354,7 +322,7 @@ class SystemInfo:
             SystemInfo._validate_key(key)
             for i in key:
                 return not self.interpolators[eval(i)] is None
-    
+
     def interpolate(self, key, bounds, params={}, resolution=100, executor=None, progress_bar=True, threads=1):
         # key must be string with 'L', 'N', and/or 'R' (e.g. 'LR')
 
@@ -371,13 +339,13 @@ class SystemInfo:
         else:
             map_func = map
 
-
         SystemInfo._validate_key(key)
 
-        #since async_results can't pass objects like progress bars and threads, create a clone of self without those
+        # since async_results can't pass objects like progress bars and threads, create a clone of self without those
 
         pseudo_self = deepcopy(self)
-        funcs = {'L': pseudo_self.refl_L, 'N': pseudo_self.smat_N, 'R': pseudo_self.refl_R}
+        funcs = {'L': pseudo_self.refl_L,
+                 'N': pseudo_self.smat_N, 'R': pseudo_self.refl_R}
 
         for i in key:
             async_result = map_func(partial(funcs[i], params=params), self.Es)
@@ -396,7 +364,8 @@ class SystemInfo:
 
     def _iter_progress_bar(self):
         while not all([res.ready() for res in self.async_results]):
-            self._progress_bar.value = sum([res.progress for res in self.async_results])
+            self._progress_bar.value = sum(
+                [res.progress for res in self.async_results])
             time.sleep(.1)
         self._progress_bar.close()
 
@@ -417,9 +386,9 @@ class SystemInfo:
                 self.async_result.result()
 
     def __getstate__(self):
-        pickle_attrs = dict(async_results = [], _pbthread = [], _progress_bar = [])
-        return {k : (v if k not in pickle_attrs else pickle_attrs[k]) for k, v in self.__dict__.items()}
-        
+        pickle_attrs = dict(async_results=[], _pbthread=[], _progress_bar=[])
+        return {k: (v if k not in pickle_attrs else pickle_attrs[k]) for k, v in self.__dict__.items()}
+
 
 #######################
 # Current Calculation #
@@ -440,11 +409,11 @@ def _S_N(n, n_, r, t, edge=0, particles=(True, True)):  # Scattering matrix in n
         if not type(r) is tuple and not type(t) is tuple:
             r = (r,)
             t = (t,)
-            
+
         for i in range(len(r)):
             _r, _t = (r[i], t[i])
-            S_e = np.matrix([[        _r  *   d(n, n_),             _t  * d(n, n_-1)],
-                             [np.conj(_t) * d(n, n_+1),    -np.conj(_r) *   d(n, n_)]])
+            S_e = np.matrix([[_r * d(n, n_),             _t * d(n, n_-1)],
+                             [np.conj(_t) * d(n, n_+1),    -np.conj(_r) * d(n, n_)]])
             S_h = dagger(S_e)
             if edge == -1:
                 S_e[1, 1] = -1
@@ -452,47 +421,50 @@ def _S_N(n, n_, r, t, edge=0, particles=(True, True)):  # Scattering matrix in n
             elif edge == 1:
                 S_e[0, 0] = -1
                 S_h[1, 1] = -1
-            for j in range(sp//len(r)): #spin states per value of i
-                for b,S_n,k in zip(particles, [S_e,S_h], range(2)):
+            for j in range(sp//len(r)):  # spin states per value of i
+                for b, S_n, k in zip(particles, [S_e, S_h], range(2)):
                     if b:
                         S[j+i+(sp*k)::2*sp, j+i+(sp*k)::2*sp] = S_n
 
     return S
 
-def _kwant_S_N(m,n,E,V,sysinfo,edge=0):
+
+def _kwant_S_N(m, n, E, V, sysinfo, edge=0):
     sp = sigma_0.shape[0]
     S = np.zeros((4*sp,)*2, dtype=np.complex)
-    if abs(n-m)>1:
+    if abs(n-m) > 1:
         return S
-    
-    eL = slice(0*sp,1*sp)
-    hL = slice(1*sp,2*sp)
-    eR = slice(2*sp,3*sp)
-    hR = slice(3*sp,4*sp)
 
-    def apply_slice(full_smat,*args):
+    eL = slice(0*sp, 1*sp)
+    hL = slice(1*sp, 2*sp)
+    eR = slice(2*sp, 3*sp)
+    hR = slice(3*sp, 4*sp)
+
+    def apply_slice(full_smat, *args):
         for arg in args:
-            S[arg]=full_smat[arg]
+            S[arg] = full_smat[arg]
     # def check_probabilities(S, precision=2):
     #     if not np.all(np.round(np.sum(np.abs(S), axis=0), precision)==1)
     #     except Exception as e:
     #         print(np.sum(np.abs(S), axis=0))
     #         raise e
 
-    if m==n:
+    if m == n:
         ep = E + m * V
-        full_smat_inc = sysinfo.smat_N(E + (m+0.5) * V) if edge !=  1 else -np.identity(S.shape[0])
-        full_smat_dec = sysinfo.smat_N(E + (m-0.5) * V) if edge != -1 else -np.identity(S.shape[0])
+        full_smat_inc = sysinfo.smat_N(
+            E + (m+0.5) * V) if edge != 1 else -np.identity(S.shape[0])
+        full_smat_dec = sysinfo.smat_N(
+            E + (m-0.5) * V) if edge != -1 else -np.identity(S.shape[0])
 
-        apply_slice(full_smat_inc, (eL,eL), (hR,hR))
-        apply_slice(full_smat_dec, (eR,eR), (hL,hL))
+        apply_slice(full_smat_inc, (eL, eL), (hR, hR))
+        apply_slice(full_smat_dec, (eR, eR), (hL, hL))
     else:
         full_smat = sysinfo.smat_N(E + (m+n)/2 * V)
-        if m<n:
-            slices = [(eL,eR), (hR,hL)]
-            apply_slice(full_smat, (eL,eR), (hR,hL))
-        else: #m>n
-            apply_slice(full_smat, (eR,eL), (hL,hR))
+        if m < n:
+            slices = [(eL, eR), (hR, hL)]
+            apply_slice(full_smat, (eL, eR), (hR, hL))
+        else:  # m>n
+            apply_slice(full_smat, (eR, eL), (hL, hR))
 
     return S
 
@@ -502,45 +474,48 @@ def _big_S_N(E, V, sysinfo, nmax):
     Z = sysinfo.Z
     if sysinfo.use_Z:
         if sysinfo.r_func is None or sysinfo.t_func is None:
-            r = lambda E: Z/np.sqrt(1+Z**2)
-            t = lambda E: 1/np.sqrt(1+Z**2)
+            def r(E): return Z/np.sqrt(1+Z**2)
+            def t(E): return 1/np.sqrt(1+Z**2)
         else:
             r = sysinfo.r_func
             t = sysinfo.t_func
-        def S_N(m,n,edge=0): 
+
+        def S_N(m, n, edge=0):
             raise Exception("This does not make physical sense")
-            return _S_N(m, n, r(E+V/2), t(E+V/2), edge, particles=(True,False)) + \
-                   _S_N(m, n, r(E-V/2), t(E-V/2), edge, particles=(False,True))
+            return _S_N(m, n, r(E+V/2), t(E+V/2), edge, particles=(True, False)) + \
+                _S_N(m, n, r(E-V/2), t(E-V/2), edge, particles=(False, True))
     else:
-        def S_N(m,n,edge=0): 
-            return _kwant_S_N(m,n,E,V,sysinfo,edge)
+        def S_N(m, n, edge=0):
+            return _kwant_S_N(m, n, E, V, sysinfo, edge)
 
     e_levels = nmax*2+1
     size = e_levels*4*identity.shape[0]
     S = np.asmatrix(np.zeros((size, size)), dtype=np.complex)
     if nmax == 0:
         return (M(L, L, L)+M(R, R, R)).T @ S_N(0, 0) @ (M(L, L, R)+M(R, R, L)) \
-            + (M(L, L, L)+M(R, R, R)).T @ (S_N(1, 0) + S_N(0, 1, 0.)) @ (M(L, L, R)+M(R, R, L)) #TODO: Use adjust energies for the scattering matrices in terms of voltage
+            + (M(L, L, L)+M(R, R, R)).T @ (S_N(1, 0) + S_N(0, 1, 0.)) @ (M(L, L, R)+M(R, R, L)
+                                                                         )  # TODO: Use adjust energies for the scattering matrices in terms of voltage
     for i, j in np.ndindex(e_levels, e_levels):
         if i == j == 0:
-            e=-1 #lowest energy
+            e = -1  # lowest energy
         elif i == j == e_levels-1:
-            e=1 #highest energy
+            e = 1  # highest energy
         else:
-            e=0
+            e = 0
 
-        #THIS IS A BODGE
-        #TODO: MAKE THIS PRETTIER AND MORE EFFICIENT, also peep a few lines above
+        # THIS IS A BODGE
+        # TODO: MAKE THIS PRETTIER AND MORE EFFICIENT, also peep a few lines above
         if sysinfo.test_flag:
             normal_S = S_N(i-nmax, j-nmax, edge=e)
         else:
             normal_S_e = S_N(i-nmax, j-nmax, edge=e)
             normal_S_h = S_N(i-nmax, j-nmax, edge=e)
             normal_S = np.zeros_like(normal_S_e)
-            sp=2
-            for k in range(sp): #spin states
-                normal_S[k::2*sp, k::2*sp] = normal_S_e[k::2*sp, k::2*sp] 
-                normal_S[k+sp::2*sp, k+sp::2*sp] = normal_S_h[k+sp::2*sp, k+sp::2*sp]
+            sp = 2
+            for k in range(sp):  # spin states
+                normal_S[k::2*sp, k::2*sp] = normal_S_e[k::2*sp, k::2*sp]
+                normal_S[k+sp::2*sp, k+sp::2 *
+                         sp] = normal_S_h[k+sp::2*sp, k+sp::2*sp]
 
         if np.count_nonzero(normal_S) != 0:
             mat = (M(L, L, L)+M(R, R, R)).T @ normal_S @ (M(L, L, R)+M(R, R, L))
@@ -576,7 +551,7 @@ def _calc_integrand(E, V, nu, sysinfo, params, E_scale, ret_J=False, components=
         raise e
     if check_convergence:
         l, v = nla.eig(S)
-        if not np.all(np.round(np.abs(l), 13)<=1):
+        if not np.all(np.round(np.abs(l), 13) <= 1):
             raise Exception("S-matrix does not converge!!")
     # represents the matrix rho_z tau_z in the Setiawan current equation.
     O_mat = -1*kron(e_mat, tau[z, z], sigma_0)
@@ -646,9 +621,9 @@ def calculate_current(V, sysinfo, params={}, min_E=None, E_scale=1, tol=1e-2, re
     global test_array
     test_array = []
     def integrand_L(E): return _calc_integrand(
-        E, V, L, sysinfo, params, E_scale,check_convergence=check_convergence)
+        E, V, L, sysinfo, params, E_scale, check_convergence=check_convergence)
     def integrand_R(E): return _calc_integrand(
-        E, V, R, sysinfo, params, E_scale,check_convergence=check_convergence)
+        E, V, R, sysinfo, params, E_scale, check_convergence=check_convergence)
     a = min_E - 0.2*E_scale  # 0.2*E_scale subtracted to capture small numerical feature
     b = 0.0
     cur = vquad.vquad(np.vectorize(integrand_L), a, b, atol=_atol(tol, sysinfo.Z))[0]\
